@@ -2,17 +2,24 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+
+	"golang.org/x/net/html"
 )
 
 const (
-	summaryField = "summary "
-	areaField    = "area: "
-	changeField  = "change: "
+	summaryField       = "summary "
+	areaField          = "area: "
+	changeField        = "change: "
+	envoyPRBaseUrl     = "https://github.com/envoyproxy/envoy/pull/"
+	envoyCommitBaseUrl = "https://github.com/envoyproxy/envoy/commit/"
 )
 
 type ChangeLogEntry struct {
@@ -127,6 +134,78 @@ func (c *ChangeLogs) ProcessGitBlameOutput(line string) {
 	}
 }
 
+func writeCSV(changeLogs *ChangeLogs, filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	writer := csv.NewWriter(f)
+
+	for _, entry := range changeLogs.logs {
+		writer.Write(entry.CommitHashes)
+	}
+
+	return nil
+}
+
+func getReferenceLinks(url string) map[string]string {
+	refMap := make(map[string]string)
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Printf("error fetching URL: %v\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("response status code was %d\n", resp.StatusCode)
+		return nil
+	}
+
+	ctype := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(ctype, "text/html") {
+		fmt.Printf("response content type was %s not text/html\n", ctype)
+		return nil
+	}
+
+	tokenizer := html.NewTokenizer(resp.Body)
+	for {
+		tt := tokenizer.Next()
+		if tt == html.ErrorToken {
+			if tokenizer.Err() == io.EOF {
+				return refMap
+			}
+			fmt.Printf("Error: %v", tokenizer.Err())
+			return nil
+		}
+		tag, hasAttr := tokenizer.TagName()
+		if string(tag) == "a" && hasAttr {
+			isRefClass := false
+			href := ""
+			for {
+				attrKey, attrValue, moreAttr := tokenizer.TagAttr()
+				if string(attrKey) == "class" && strings.HasPrefix(string(attrValue), "reference") {
+					isRefClass = true
+				}
+				if string(attrKey) == "href" {
+					href = string(attrValue)
+				}
+
+				if !moreAttr {
+					if isRefClass && len(href) > 0 {
+						for tokenizer.Next() != html.TextToken {
+							refMap[tokenizer.Token().Data] = href
+						}
+						refMap[tokenizer.Token().Data] = href
+					}
+					break
+				}
+			}
+		}
+	}
+
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		err := fmt.Errorf("usage: %s <changelog_file>", os.Args[0])
@@ -172,13 +251,34 @@ func main() {
 		panic(err)
 	}
 
+	envoyhost := "https://www.envoyproxy.io"
+	version := "v1.33.0"
+	lastDotIndex := strings.LastIndex(version, ".")
+	majorminor := version[0:lastDotIndex]
+	baseUrl := envoyhost + "/docs/envoy/latest/version_history/" + majorminor + "/"
+	refMap := getReferenceLinks(baseUrl + version)
+	// fmt.Printf("refMap:\n%v", refMap)
+	refRegexp := regexp.MustCompile(":ref:`([_a-zA-Z0-9%]+)[^`]*`")
+	optionRegexp := regexp.MustCompile(":option:`([^`]*)`")
 	for _, entry := range changeLogs.logs {
 		fmt.Printf("commit: %v\n", entry.CommitHashes)
 		fmt.Printf("pr: %v\n", entry.PR)
 		fmt.Printf("category: %s\n", entry.Category)
 		fmt.Printf("area: %s\n", entry.Area)
 		fmt.Printf("summary: %v\n", entry.Summary)
-		fmt.Printf("description:\n%s\n", entry.Description)
+
+		description := refRegexp.ReplaceAllStringFunc(entry.Description, func(s string) string {
+			refMatches := refRegexp.FindAllStringSubmatch(s, -1)
+			key := refMatches[0][1]
+			return "(" + key + "|" + refMap[key] + ")"
+		})
+		description = optionRegexp.ReplaceAllStringFunc(description, func(s string) string {
+			refMatches := optionRegexp.FindAllStringSubmatch(s, -1)
+			key := refMatches[0][1]
+			return "(" + key + "|" + envoyhost + refMap[key] + ")"
+		})
+		//fmt.Printf("description:\n%s\n", entry.Description)
+		fmt.Printf("description:\n%s\n", description)
 		//		fmt.Printf("detected Change: %v\n", entry.ProcessChangeLines)
 		fmt.Println("----------------------------------------------------------------")
 	}
