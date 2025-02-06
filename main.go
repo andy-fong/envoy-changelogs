@@ -261,12 +261,22 @@ func main() {
 	refRegexp := regexp.MustCompile(":ref:`([_a-zA-Z0-9%]+)[^`]*`")
 	optionRegexp := regexp.MustCompile(":option:`([^`]*)`")
 	for _, entry := range changeLogs.logs {
-		fmt.Printf("category: %s\n", entry.Category)
-		fmt.Printf("area: %s\n", entry.Area)
+		fmt.Printf("**category**   : %s  \n", entry.Category)
+		fmt.Printf("**area**       : %s  \n", entry.Area)
 		for _, summary := range entry.Summary {
-			fmt.Printf("summary: %v\n", summary)
+			fmt.Printf("**summary**    : %v  \n", summary)
 		}
-
+		fmt.Printf("**commit**     : ")
+		for _, commit := range entry.CommitHashes {
+			fmt.Printf("[%v](%v%v) ", commit, envoyCommitBaseUrl, commit)
+		}
+		fmt.Printf(" \n")
+		//		fmt.Printf("%v %v\n", entry.CommitHashes, entry.PR)
+		fmt.Printf("**pr**         : ")
+		for _, pr := range entry.PR {
+			fmt.Printf("[%v](%v%v) ", pr, envoyPRBaseUrl, pr)
+		}
+		fmt.Printf(" \n")
 		description := refRegexp.ReplaceAllStringFunc(entry.Description, func(s string) string {
 			refMatches := refRegexp.FindAllStringSubmatch(s, -1)
 			key := refMatches[0][1]
@@ -278,19 +288,9 @@ func main() {
 			return "[" + key + "](" + envoyhost + refMap[key] + ")"
 		})
 		//fmt.Printf("description:\n%s\n", entry.Description)
-		fmt.Printf("description:\n%s\n", description)
+		fmt.Printf("**description**:  \n%s  \n", description)
 		//		fmt.Printf("detected Change: %v\n", entry.ProcessChangeLines)
-		fmt.Printf("commit: ")
-		for _, commit := range entry.CommitHashes {
-			fmt.Printf("[%v](%v%v) ", commit, envoyCommitBaseUrl, commit)
-		}
-		fmt.Printf("\n")
-		//		fmt.Printf("%v %v\n", entry.CommitHashes, entry.PR)
-		fmt.Printf("pr: ")
-		for _, pr := range entry.PR {
-			fmt.Printf("[%v](%v%v) ", pr, envoyPRBaseUrl, pr)
-		}
-		fmt.Printf("\n\n")
+		fmt.Printf(" \n")
 		fmt.Println("---")
 		fmt.Printf("\n")
 	}

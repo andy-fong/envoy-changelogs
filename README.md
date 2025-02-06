@@ -4,5 +4,5 @@ Check out the branch of the new release (eg v1.33.0) locally
 
 In the envoy directory, run:
 ```
-../collect-changelogs/collect-changelogs changelogs/current.yaml
-111
+../envoy-changelogs/collect-changelogs changelogs/current.yaml > ../envoy-changelogs/v1.33.0.md
+```
