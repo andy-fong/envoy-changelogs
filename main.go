@@ -260,7 +260,15 @@ func main() {
 	// fmt.Printf("refMap:\n%v", refMap)
 	refRegexp := regexp.MustCompile(":ref:`([_a-zA-Z0-9%]+)[^`]*`")
 	optionRegexp := regexp.MustCompile(":option:`([^`]*)`")
+	fmt.Printf("# Envoy Release %s\n\n", version)
+
+	fmt.Printf("[release note](%s%s)\n\n", baseUrl, version)
+	currentCategory := ""
 	for _, entry := range changeLogs.logs {
+		if currentCategory != entry.Category {
+			currentCategory = entry.Category
+			fmt.Printf("## %s\n\n", currentCategory)
+		}
 		fmt.Printf("**category**   : %s  \n", entry.Category)
 		fmt.Printf("**area**       : %s  \n", entry.Area)
 		for _, summary := range entry.Summary {
