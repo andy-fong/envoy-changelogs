@@ -117,9 +117,11 @@ func (c *ChangeLogs) ProcessContent(line string) {
 
 func (c *ChangeLogs) ProcessGitBlameOutput(line string) {
 	if strings.HasPrefix(line, "\t") {
+		fmt.Printf("line0: %s\n", line)
 		c.ProcessContent(line)
 		return
 	} else {
+		fmt.Printf("line1: %s\n", line)
 		parts := strings.SplitN(line, " ", 2)
 		if parts[0] == c.hexRegexp.FindString(parts[0]) {
 			c.lastCommitHash = parts[0]
