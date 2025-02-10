@@ -1,8 +1,5 @@
-This utility needs to be run inside the envoy directory as it execute git commands against the repo.
+To run this utility, you must have an envoy repo already cloned and checked out to the release branch you want to generate the change logs.
 
-Check out the branch of the new release (eg v1.33.0) locally
-
-In the envoy directory, run:
 ```
-../envoy-changelogs/collect-changelogs changelogs/current.yaml > ../envoy-changelogs/v1.33.0.md
+go run main.go <path_to_your_envoy_repop> > v1.33.0.md
 ```
