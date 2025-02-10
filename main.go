@@ -1,16 +1,16 @@
 package main
 
 import (
-	"bufio"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"golang.org/x/net/html"
 )
 
@@ -34,19 +34,18 @@ type ChangeLogEntry struct {
 
 type ChangeLogs struct {
 	logs             []*ChangeLogEntry
-	hexRegexp        *regexp.Regexp
 	categoryRegexp   *regexp.Regexp
 	prRegexp         *regexp.Regexp
-	lastCommitHash   string
+	LastCommitHash   string
 	currentCategory  string
 	currentEntry     *ChangeLogEntry
-	commitSummaryMap map[string]string
+	CommitSummaryMap map[string]string
 }
 
 func (c *ChangeLogs) addCurrentEntry() {
 	if c.currentEntry != nil && len(c.currentEntry.Category) != 0 {
 		for _, commitHash := range c.currentEntry.CommitHashes {
-			summary := c.commitSummaryMap[commitHash]
+			summary := c.CommitSummaryMap[commitHash]
 			c.currentEntry.Summary = append(c.currentEntry.Summary, summary)
 			pr := c.prRegexp.FindString(summary)
 			if len(pr) > 4 {
@@ -63,11 +62,11 @@ func (c *ChangeLogs) createNewCurrentEntry() {
 	c.currentEntry = &ChangeLogEntry{
 		Category: c.currentCategory,
 	}
-	c.currentEntry.CommitHashes = append(c.currentEntry.CommitHashes, c.lastCommitHash)
+	c.currentEntry.CommitHashes = append(c.currentEntry.CommitHashes, c.LastCommitHash)
 }
 
 func (c *ChangeLogs) ProcessContent(line string) {
-	line = strings.TrimLeft(line, "\t")
+	// line = strings.TrimLeft(line, "\t")
 	//	fmt.Printf("processing: %s\n", line)
 
 	if len(line) == 0 {
@@ -90,12 +89,12 @@ func (c *ChangeLogs) ProcessContent(line string) {
 
 	commitHashAlreadyExists := false
 	for _, commitHash := range c.currentEntry.CommitHashes {
-		if commitHash == c.lastCommitHash {
+		if commitHash == c.LastCommitHash {
 			commitHashAlreadyExists = true
 		}
 	}
 	if !commitHashAlreadyExists {
-		c.currentEntry.CommitHashes = append(c.currentEntry.CommitHashes, c.lastCommitHash)
+		c.currentEntry.CommitHashes = append(c.currentEntry.CommitHashes, c.LastCommitHash)
 	}
 	line = strings.TrimLeft(line, "- ")
 
@@ -115,39 +114,7 @@ func (c *ChangeLogs) ProcessContent(line string) {
 	}
 }
 
-func (c *ChangeLogs) ProcessGitBlameOutput(line string) {
-	if strings.HasPrefix(line, "\t") {
-		fmt.Printf("line0: %s\n", line)
-		c.ProcessContent(line)
-		return
-	} else {
-		fmt.Printf("line1: %s\n", line)
-		parts := strings.SplitN(line, " ", 2)
-		if parts[0] == c.hexRegexp.FindString(parts[0]) {
-			c.lastCommitHash = parts[0]
-			return
-		}
-	}
-
-	if strings.HasPrefix(line, summaryField) {
-		summary := line[len(summaryField):]
-		// fmt.Printf("%s: %s\n", c.lastCommitHash, summary)
-		c.commitSummaryMap[c.lastCommitHash] = summary
-	}
-}
-
-func writeCSV(changeLogs *ChangeLogs, filename string) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	writer := csv.NewWriter(f)
-
-	for _, entry := range changeLogs.logs {
-		writer.Write(entry.CommitHashes)
-	}
-
-	return nil
+func (c *ChangeLogs) ProcessGitBlameOutput(br *git.BlameResult) {
 }
 
 func getReferenceLinks(url string) map[string]string {
@@ -208,14 +175,24 @@ func getReferenceLinks(url string) map[string]string {
 
 }
 
+func getCommitSummary(commit *object.Commit) string {
+	lines := strings.Split(commit.Message, "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+
+	return strings.TrimSpace(lines[0])
+}
+
 func main() {
 	if len(os.Args) != 2 {
-		err := fmt.Errorf("usage: %s <changelog_file>", os.Args[0])
+		err := fmt.Errorf("usage: %s <envoy_repo_directory>", os.Args[0])
 		panic(err)
 	}
 
-	changeLogFile := os.Args[1]
-	if _, err := os.Stat(changeLogFile); err != nil {
+	repoDir := os.Args[1]
+	changeLogFile := "changelogs/current.yaml"
+	if _, err := os.Stat(filepath.Join(repoDir, changeLogFile)); err != nil {
 		if os.IsNotExist(err) {
 			err = fmt.Errorf("File %s does not exist", changeLogFile)
 		} else {
@@ -224,37 +201,46 @@ func main() {
 		panic(err)
 	}
 
-	cmd := exec.Command("git", "blame", "-p", changeLogFile)
-
-	stdout, err := cmd.StdoutPipe()
+	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
 		panic(err)
 	}
 
-	if err := cmd.Start(); err != nil {
+	h, err := repo.Head()
+	if err != nil {
 		panic(err)
 	}
 
-	scanner := bufio.NewScanner(stdout)
-	changeLogs := &ChangeLogs{
-		categoryRegexp:   regexp.MustCompile(`^[a-z_]+:$`),
-		hexRegexp:        regexp.MustCompile(`[0-9a-f]+`),
-		prRegexp:         regexp.MustCompile(`\(#[0-9]+\)`),
-		commitSummaryMap: make(map[string]string),
+	version := h.Name().Short()
+	// fmt.Printf("version: %s\n", version)
+
+	c, err := repo.CommitObject(h.Hash())
+	if err != nil {
+		panic(err)
 	}
 
-	for scanner.Scan() {
-		changeLogs.ProcessGitBlameOutput(scanner.Text())
+	// Blame the given file/path.
+	br, err := git.Blame(c, changeLogFile)
+	if err != nil {
+		panic(err)
+	}
+
+	changeLogs := &ChangeLogs{
+		categoryRegexp:   regexp.MustCompile(`^[a-z_]+:$`),
+		prRegexp:         regexp.MustCompile(`\(#[0-9]+\)`),
+		CommitSummaryMap: make(map[string]string),
+	}
+
+	for _, line := range br.Lines {
+		changeLogs.LastCommitHash = line.Hash.String()
+		changeLogs.ProcessContent(line.Text)
+		commit, _ := repo.CommitObject(line.Hash)
+		changeLogs.CommitSummaryMap[changeLogs.LastCommitHash] = getCommitSummary(commit)
 	}
 	// Takes care of the last outstanding entry
 	changeLogs.addCurrentEntry()
 
-	if err := cmd.Wait(); err != nil {
-		panic(err)
-	}
-
 	envoyhost := "https://www.envoyproxy.io"
-	version := "v1.33.0"
 	lastDotIndex := strings.LastIndex(version, ".")
 	majorminor := version[0:lastDotIndex]
 	baseUrl := envoyhost + "/docs/envoy/latest/version_history/" + majorminor + "/"
