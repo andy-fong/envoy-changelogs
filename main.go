@@ -127,7 +127,7 @@ func getReferenceLinks(url string) map[string]string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("response status code was %d\n", resp.StatusCode)
+		fmt.Printf("%s returns status code %d\n", url, resp.StatusCode)
 		return nil
 	}
 
