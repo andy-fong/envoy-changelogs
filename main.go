@@ -246,7 +246,7 @@ func main() {
 	baseUrl := envoyhost + "/docs/envoy/latest/version_history/" + majorminor + "/"
 	refMap := getReferenceLinks(baseUrl + version)
 	// fmt.Printf("refMap:\n%v", refMap)
-	refRegexp := regexp.MustCompile(":ref:`([_a-zA-Z0-9%]+)[^`]*`")
+	refRegexp := regexp.MustCompile(":ref:`([^`]+) *(<[^`]*)`")
 	optionRegexp := regexp.MustCompile(":option:`([^`]*)`")
 	fmt.Printf("# Envoy Release %s\n\n", version)
 
@@ -275,7 +275,7 @@ func main() {
 		fmt.Printf(" \n")
 		description := refRegexp.ReplaceAllStringFunc(entry.Description, func(s string) string {
 			refMatches := refRegexp.FindAllStringSubmatch(s, -1)
-			key := refMatches[0][1]
+			key := strings.TrimRight(refMatches[0][1], " ")
 			return "[" + key + "](" + refMap[key] + ")"
 		})
 		description = optionRegexp.ReplaceAllStringFunc(description, func(s string) string {
