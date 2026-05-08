@@ -122,19 +122,19 @@ func getReferenceLinks(url string) map[string]string {
 	refMap := make(map[string]string)
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Printf("error fetching URL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error fetching URL: %v\n", err)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("%s returns status code %d\n", url, resp.StatusCode)
+		fmt.Fprintf(os.Stderr, "%s returns status code %d\n", url, resp.StatusCode)
 		return nil
 	}
 
 	ctype := resp.Header.Get("Content-Type")
 	if !strings.HasPrefix(ctype, "text/html") {
-		fmt.Printf("response content type was %s not text/html\n", ctype)
+		fmt.Fprintf(os.Stderr, "response content type was %s not text/html\n", ctype)
 		return nil
 	}
 
@@ -145,7 +145,7 @@ func getReferenceLinks(url string) map[string]string {
 			if tokenizer.Err() == io.EOF {
 				return refMap
 			}
-			fmt.Printf("Error: %v", tokenizer.Err())
+			fmt.Fprintf(os.Stderr, "Error: %v", tokenizer.Err())
 			return nil
 		}
 		tag, hasAttr := tokenizer.TagName()
@@ -331,7 +331,13 @@ func main() {
 		}
 	}
 
-	// fmt.Printf("version: %s\n", version)
+	if !strings.HasPrefix(version, "v") {
+		if idx := strings.Index(version, "v"); idx != -1 {
+			version = version[idx:]
+		}
+	}
+
+	// fmt.Fprintf(os.Stderr, "version: %s\n", version)
 
 	c, err := repo.CommitObject(commitHash)
 	if err != nil {
@@ -364,7 +370,7 @@ func main() {
 	majorminor := version[0:lastDotIndex]
 	baseUrl := envoyhost + "/docs/envoy/latest/version_history/" + majorminor + "/"
 	refMap := getReferenceLinks(baseUrl + version)
-	// fmt.Printf("refMap:\n%v", refMap)
+	//	fmt.Fprintf(os.Stderr, "refMap:\n%v", refMap)
 	refRegexp := regexp.MustCompile(":ref:`([^`]+) *(<[^`]*)`")
 	optionRegexp := regexp.MustCompile(":option:`([^`]*)`")
 	fmt.Printf("# Envoy Release %s\n\n", version)
