@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"golang.org/x/net/html"
 )
@@ -184,6 +185,100 @@ func getCommitSummary(commit *object.Commit) string {
 	return strings.TrimSpace(lines[0])
 }
 
+func isErrReferenceNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "reference not found")
+}
+
+// readWorktreeHead handles linked worktrees where go-git's repo.Head() fails.
+// A linked worktree has .git as a file pointing to .git/worktrees/<name>;
+// HEAD is stored there rather than in the main .git directory.
+func readWorktreeHead(repoDir string) (string, plumbing.Hash, error) {
+	gitFilePath := filepath.Join(repoDir, ".git")
+	fi, err := os.Stat(gitFilePath)
+	if err != nil {
+		return "", plumbing.ZeroHash, fmt.Errorf("cannot stat .git: %w", err)
+	}
+	if fi.IsDir() {
+		return "", plumbing.ZeroHash, fmt.Errorf("not a linked worktree: .git is a directory")
+	}
+
+	data, err := os.ReadFile(gitFilePath)
+	if err != nil {
+		return "", plumbing.ZeroHash, err
+	}
+	gitdir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir: "))
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(repoDir, gitdir)
+	}
+
+	headData, err := os.ReadFile(filepath.Join(gitdir, "HEAD"))
+	if err != nil {
+		return "", plumbing.ZeroHash, err
+	}
+	headStr := strings.TrimSpace(string(headData))
+
+	if strings.HasPrefix(headStr, "ref: ") {
+		ref := strings.TrimPrefix(headStr, "ref: ")
+		branchName := filepath.Base(ref)
+		// gitdir is .git/worktrees/<name>; main git dir is two levels up
+		mainGitDir := filepath.Clean(filepath.Join(gitdir, "..", ".."))
+		hash, err := resolveGitRef(mainGitDir, ref)
+		if err != nil {
+			return "", plumbing.ZeroHash, err
+		}
+		return branchName, hash, nil
+	}
+
+	// Detached HEAD
+	return headStr[:8], plumbing.NewHash(headStr), nil
+}
+
+// findMainWorkDir follows the .git file and commondir to locate the main repo's working directory.
+func findMainWorkDir(repoDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(repoDir, ".git"))
+	if err != nil {
+		return "", err
+	}
+	gitdir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "gitdir: "))
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(repoDir, gitdir)
+	}
+
+	// commondir (if present) points to the main .git dir relative to gitdir
+	commondirData, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
+	if err != nil {
+		// No commondir: gitdir itself is the main .git dir
+		return filepath.Dir(gitdir), nil
+	}
+	commondir := strings.TrimSpace(string(commondirData))
+	if !filepath.IsAbs(commondir) {
+		commondir = filepath.Join(gitdir, commondir)
+	}
+	return filepath.Dir(filepath.Clean(commondir)), nil
+}
+
+func resolveGitRef(gitDir, ref string) (plumbing.Hash, error) {
+	// Try loose ref
+	refPath := filepath.Join(gitDir, filepath.FromSlash(ref))
+	if data, err := os.ReadFile(refPath); err == nil {
+		return plumbing.NewHash(strings.TrimSpace(string(data))), nil
+	}
+
+	// Try packed-refs
+	packedRefs, err := os.ReadFile(filepath.Join(gitDir, "packed-refs"))
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("ref %s not found", ref)
+	}
+	for _, line := range strings.Split(string(packedRefs), "\n") {
+		if strings.HasSuffix(line, " "+ref) {
+			if parts := strings.Fields(line); len(parts) >= 2 {
+				return plumbing.NewHash(parts[0]), nil
+			}
+		}
+	}
+	return plumbing.ZeroHash, fmt.Errorf("ref %s not found in packed-refs", ref)
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		err := fmt.Errorf("usage: %s <envoy_repo_directory>", os.Args[0])
@@ -201,20 +296,44 @@ func main() {
 		panic(err)
 	}
 
-	repo, err := git.PlainOpen(repoDir)
+	options := &git.PlainOpenOptions{
+		DetectDotGit: true,
+	}
+	repo, err := git.PlainOpenWithOptions(repoDir, options)
 	if err != nil {
 		panic(err)
 	}
 
 	h, err := repo.Head()
-	if err != nil {
+	if err != nil && !isErrReferenceNotFound(err) {
 		panic(err)
 	}
 
-	version := h.Name().Short()
+	var version string
+	var commitHash plumbing.Hash
+	if err == nil {
+		version = h.Name().Short()
+		commitHash = h.Hash()
+	} else {
+		// go-git doesn't support linked worktrees; read HEAD from the worktree gitdir directly
+		// and reopen the main repo so CommitObject/Blame can access the full object store.
+		version, commitHash, err = readWorktreeHead(repoDir)
+		if err != nil {
+			panic(err)
+		}
+		mainWorkDir, err := findMainWorkDir(repoDir)
+		if err != nil {
+			panic(err)
+		}
+		repo, err = git.PlainOpen(mainWorkDir)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	// fmt.Printf("version: %s\n", version)
 
-	c, err := repo.CommitObject(h.Hash())
+	c, err := repo.CommitObject(commitHash)
 	if err != nil {
 		panic(err)
 	}
