@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -21,7 +23,20 @@ const (
 	changeField        = "change: "
 	envoyPRBaseUrl     = "https://github.com/envoyproxy/envoy/pull/"
 	envoyCommitBaseUrl = "https://github.com/envoyproxy/envoy/commit/"
+	changeLogFile      = "changelogs/current.yaml"
+	changeLogDir       = "changelogs/current"
 )
+
+// sectionOrder matches the section order in changelogs/changelogs.yaml.
+var sectionOrder = []string{
+	"changes",
+	"behavior_changes",
+	"minor_behavior_changes",
+	"bug_fixes",
+	"removed_config_or_runtime",
+	"new_features",
+	"deprecated",
+}
 
 type ChangeLogEntry struct {
 	CommitHashes       []string
@@ -279,6 +294,202 @@ func resolveGitRef(gitDir, ref string) (plumbing.Hash, error) {
 	return plumbing.ZeroHash, fmt.Errorf("ref %s not found in packed-refs", ref)
 }
 
+func runGit(repoDir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return string(out), nil
+}
+
+// rstToText joins wrapped lines into single lines, keeping blank-line paragraph breaks.
+func rstToText(content string) string {
+	var paragraphs []string
+	var current []string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			if len(current) > 0 {
+				paragraphs = append(paragraphs, strings.Join(current, " "))
+				current = nil
+			}
+			continue
+		}
+		current = append(current, line)
+	}
+	if len(current) > 0 {
+		paragraphs = append(paragraphs, strings.Join(current, " "))
+	}
+	return strings.Join(paragraphs, "  \n\n")
+}
+
+func sectionRank(section string) int {
+	for i, s := range sectionOrder {
+		if s == section {
+			return i
+		}
+	}
+	return len(sectionOrder)
+}
+
+// collectEntryFiles builds changelog entries from changelogs/current/<section>/<area>__<slug>.rst.
+// The commits for each entry are every commit that touched the file (following renames)
+// back to the commit that added it.
+// It also returns the commits that moved entries out of changelogs/current.yaml into this layout.
+func collectEntryFiles(repoDir, rev string, prRegexp *regexp.Regexp) ([]*ChangeLogEntry, []string, error) {
+	out, err := runGit(repoDir, "ls-tree", "-r", "--name-only", rev, "--", changeLogDir+"/")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// tracked maps the path a file has at the commit being examined to its entry.
+	tracked := make(map[string]*ChangeLogEntry)
+	var logs []*ChangeLogEntry
+	for _, path := range strings.Split(strings.TrimSpace(out), "\n") {
+		if !strings.HasSuffix(path, ".rst") {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(path, changeLogDir+"/"), "/")
+		if len(parts) != 2 {
+			fmt.Fprintf(os.Stderr, "warning: unexpected changelog path: %s\n", path)
+			continue
+		}
+		area, _, _ := strings.Cut(strings.TrimSuffix(parts[1], ".rst"), "__")
+		content, err := runGit(repoDir, "show", rev+":"+path)
+		if err != nil {
+			return nil, nil, err
+		}
+		entry := &ChangeLogEntry{
+			Category:    parts[0],
+			Area:        strings.ReplaceAll(area, "~", "/"),
+			Description: rstToText(content),
+		}
+		tracked[path] = entry
+		logs = append(logs, entry)
+	}
+
+	var migrationCommits []string
+	out, err = runGit(repoDir, "log", "-M", "--name-status", "--format=%x00%H%x09%s", rev, "--", changeLogDir+"/", changeLogFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, block := range strings.Split(out, "\x00") {
+		lines := strings.Split(strings.TrimSpace(block), "\n")
+		hash, summary, ok := strings.Cut(lines[0], "\t")
+		if !ok {
+			continue
+		}
+		touchesChangeLogFile := slices.ContainsFunc(lines[1:], func(line string) bool {
+			return strings.HasSuffix(line, "\t"+changeLogFile)
+		})
+		for _, line := range lines[1:] {
+			fields := strings.Split(line, "\t")
+			if len(fields) < 2 {
+				continue
+			}
+			path := fields[len(fields)-1]
+			entry := tracked[path]
+			if entry == nil {
+				continue
+			}
+			entry.CommitHashes = append(entry.CommitHashes, hash)
+			entry.Summary = append(entry.Summary, summary)
+			if pr := prRegexp.FindString(summary); len(pr) > 4 {
+				entry.PR = append(entry.PR, pr[2:len(pr)-1])
+			}
+			delete(tracked, path)
+			switch fields[0][0] {
+			case 'R':
+				tracked[fields[1]] = entry
+			case 'M':
+				tracked[path] = entry
+			}
+			// 'A' ends the history of this entry. If the same commit changed current.yaml,
+			// the entry was moved from there rather than newly written.
+			if fields[0] == "A" && touchesChangeLogFile && !slices.Contains(migrationCommits, hash) {
+				migrationCommits = append(migrationCommits, hash)
+			}
+		}
+	}
+
+	for _, entry := range logs {
+		// git log is newest first; list the commit that added the entry first.
+		slices.Reverse(entry.CommitHashes)
+		slices.Reverse(entry.Summary)
+		slices.Reverse(entry.PR)
+	}
+	slices.SortStableFunc(logs, func(a, b *ChangeLogEntry) int {
+		return sectionRank(a.Category) - sectionRank(b.Category)
+	})
+	return logs, migrationCommits, nil
+}
+
+func normalizeDescription(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
+// mergeMigratedEntries prepends the history from the pre-migration current.yaml to entries
+// that were created by the migration commit, so they link to the PR that introduced them.
+func mergeMigratedEntries(logs, oldLogs []*ChangeLogEntry, migrationCommit string) {
+	used := make(map[*ChangeLogEntry]bool)
+	find := func(entry *ChangeLogEntry, match func(old, cur string) bool) *ChangeLogEntry {
+		cur := normalizeDescription(entry.Description)
+		for _, old := range oldLogs {
+			if !used[old] && old.Category == entry.Category && old.Area == entry.Area &&
+				match(normalizeDescription(old.Description), cur) {
+				return old
+			}
+		}
+		return nil
+	}
+	for _, entry := range logs {
+		if len(entry.CommitHashes) == 0 || entry.CommitHashes[0] != migrationCommit {
+			continue
+		}
+		old := find(entry, func(old, cur string) bool { return old == cur })
+		if old == nil {
+			// The text may have been touched up during migration; fall back to a prefix match.
+			old = find(entry, func(old, cur string) bool {
+				n := min(len(old), len(cur), 40)
+				return old[:n] == cur[:n]
+			})
+		}
+		if old == nil {
+			fmt.Fprintf(os.Stderr, "warning: no pre-migration entry found for %s/%s\n", entry.Category, entry.Area)
+			continue
+		}
+		used[old] = true
+		entry.CommitHashes = append(old.CommitHashes, entry.CommitHashes...)
+		entry.Summary = append(old.Summary, entry.Summary...)
+		entry.PR = append(old.PR, entry.PR...)
+	}
+}
+
+// blameChangeLogFile collects entries from changelogs/current.yaml at the given commit.
+func blameChangeLogFile(repo *git.Repository, c *object.Commit) *ChangeLogs {
+	br, err := git.Blame(c, changeLogFile)
+	if err != nil {
+		panic(err)
+	}
+
+	changeLogs := &ChangeLogs{
+		categoryRegexp:   regexp.MustCompile(`^[a-z_]+:$`),
+		prRegexp:         regexp.MustCompile(`\(#[0-9]+\)`),
+		CommitSummaryMap: make(map[string]string),
+	}
+	for _, line := range br.Lines {
+		changeLogs.LastCommitHash = line.Hash.String()
+		changeLogs.ProcessContent(line.Text)
+		commit, _ := repo.CommitObject(line.Hash)
+		changeLogs.CommitSummaryMap[changeLogs.LastCommitHash] = getCommitSummary(commit)
+	}
+	// Takes care of the last outstanding entry
+	changeLogs.addCurrentEntry()
+	return changeLogs
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		err := fmt.Errorf("usage: %s <envoy_repo_directory>", os.Args[0])
@@ -286,14 +497,17 @@ func main() {
 	}
 
 	repoDir := os.Args[1]
-	changeLogFile := "changelogs/current.yaml"
+	// Starting with v1.39, envoy keeps one file per entry in
+	// changelogs/current/<section>/<area>__<slug>.rst instead of current.yaml.
+	useEntryDir := false
 	if _, err := os.Stat(filepath.Join(repoDir, changeLogFile)); err != nil {
-		if os.IsNotExist(err) {
-			err = fmt.Errorf("File %s does not exist", changeLogFile)
-		} else {
-			err = fmt.Errorf("Error checking file %s:", changeLogFile, err)
+		if !os.IsNotExist(err) {
+			panic(fmt.Errorf("Error checking file %s: %w", changeLogFile, err))
 		}
-		panic(err)
+		if fi, err := os.Stat(filepath.Join(repoDir, changeLogDir)); err != nil || !fi.IsDir() {
+			panic(fmt.Errorf("Neither %s nor %s/ exists", changeLogFile, changeLogDir))
+		}
+		useEntryDir = true
 	}
 
 	options := &git.PlainOpenOptions{
@@ -344,26 +558,28 @@ func main() {
 		panic(err)
 	}
 
-	// Blame the given file/path.
-	br, err := git.Blame(c, changeLogFile)
-	if err != nil {
-		panic(err)
+	var changeLogs *ChangeLogs
+	if useEntryDir {
+		changeLogs = &ChangeLogs{}
+		var migrationCommits []string
+		changeLogs.logs, migrationCommits, err = collectEntryFiles(repoDir, commitHash.String(), regexp.MustCompile(`\(#[0-9]+\)`))
+		if err != nil {
+			panic(err)
+		}
+		for _, migrationCommit := range migrationCommits {
+			mc, err := repo.CommitObject(plumbing.NewHash(migrationCommit))
+			if err != nil {
+				panic(err)
+			}
+			parent, err := mc.Parent(0)
+			if err != nil {
+				panic(err)
+			}
+			mergeMigratedEntries(changeLogs.logs, blameChangeLogFile(repo, parent).logs, migrationCommit)
+		}
+	} else {
+		changeLogs = blameChangeLogFile(repo, c)
 	}
-
-	changeLogs := &ChangeLogs{
-		categoryRegexp:   regexp.MustCompile(`^[a-z_]+:$`),
-		prRegexp:         regexp.MustCompile(`\(#[0-9]+\)`),
-		CommitSummaryMap: make(map[string]string),
-	}
-
-	for _, line := range br.Lines {
-		changeLogs.LastCommitHash = line.Hash.String()
-		changeLogs.ProcessContent(line.Text)
-		commit, _ := repo.CommitObject(line.Hash)
-		changeLogs.CommitSummaryMap[changeLogs.LastCommitHash] = getCommitSummary(commit)
-	}
-	// Takes care of the last outstanding entry
-	changeLogs.addCurrentEntry()
 
 	envoyhost := "https://www.envoyproxy.io"
 	lastDotIndex := strings.LastIndex(version, ".")
@@ -401,6 +617,9 @@ func main() {
 		description := refRegexp.ReplaceAllStringFunc(entry.Description, func(s string) string {
 			refMatches := refRegexp.FindAllStringSubmatch(s, -1)
 			key := strings.TrimRight(refMatches[0][1], " ")
+			if len(refMap[key]) == 0 {
+				return "`" + key + "`"
+			}
 			return "[" + key + "](" + refMap[key] + ")"
 		})
 		description = optionRegexp.ReplaceAllStringFunc(description, func(s string) string {
