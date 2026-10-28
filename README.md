@@ -1,5 +1,12 @@
-To run this utility, you must have an envoy repo already cloned and **checked out to the release branch** you want to generate the change logs.
-The release branch name should look something like "v1.33.0"
+To run this utility, you must have an envoy repo already cloned with the release tags fetched
+(`git fetch --tags`). Pass the version tag; the branch you have checked out doesn't matter:
+
+```
+go run main.go <path_to_your_envoy_repo> v1.39.0 > v1.39.0.md
+```
+
+Alternatively, omit the tag and the version is taken from the checked out branch, which should be
+named like the release (e.g. "v1.33.0"):
 
 ```
 go run main.go <path_to_your_envoy_repo> > v1.33.0.md

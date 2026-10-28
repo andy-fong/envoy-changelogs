@@ -490,59 +490,95 @@ func blameChangeLogFile(repo *git.Repository, c *object.Commit) *ChangeLogs {
 	return changeLogs
 }
 
-func main() {
-	if len(os.Args) != 2 {
-		err := fmt.Errorf("usage: %s <envoy_repo_directory>", os.Args[0])
-		panic(err)
-	}
-
-	repoDir := os.Args[1]
-	// Starting with v1.39, envoy keeps one file per entry in
-	// changelogs/current/<section>/<area>__<slug>.rst instead of current.yaml.
-	useEntryDir := false
-	if _, err := os.Stat(filepath.Join(repoDir, changeLogFile)); err != nil {
-		if !os.IsNotExist(err) {
-			panic(fmt.Errorf("Error checking file %s: %w", changeLogFile, err))
+// openRepo opens the repository, using the main repo's object store for linked worktrees.
+func openRepo(repoDir string) (*git.Repository, error) {
+	if fi, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil && !fi.IsDir() {
+		mainWorkDir, err := findMainWorkDir(repoDir)
+		if err != nil {
+			return nil, err
 		}
-		if fi, err := os.Stat(filepath.Join(repoDir, changeLogDir)); err != nil || !fi.IsDir() {
-			panic(fmt.Errorf("Neither %s nor %s/ exists", changeLogFile, changeLogDir))
-		}
-		useEntryDir = true
+		return git.PlainOpen(mainWorkDir)
 	}
+	return git.PlainOpenWithOptions(repoDir, &git.PlainOpenOptions{DetectDotGit: true})
+}
 
+// openRepoAtHead opens the repository and returns the checked out branch name and commit.
+func openRepoAtHead(repoDir string) (*git.Repository, string, plumbing.Hash, error) {
 	options := &git.PlainOpenOptions{
 		DetectDotGit: true,
 	}
 	repo, err := git.PlainOpenWithOptions(repoDir, options)
 	if err != nil {
-		panic(err)
+		return nil, "", plumbing.ZeroHash, err
 	}
 
 	h, err := repo.Head()
-	if err != nil && !isErrReferenceNotFound(err) {
+	if err == nil {
+		return repo, h.Name().Short(), h.Hash(), nil
+	}
+	if !isErrReferenceNotFound(err) {
+		return nil, "", plumbing.ZeroHash, err
+	}
+
+	// go-git doesn't support linked worktrees; read HEAD from the worktree gitdir directly
+	// and reopen the main repo so CommitObject/Blame can access the full object store.
+	version, commitHash, err := readWorktreeHead(repoDir)
+	if err != nil {
+		return nil, "", plumbing.ZeroHash, err
+	}
+	repo, err = openRepo(repoDir)
+	if err != nil {
+		return nil, "", plumbing.ZeroHash, err
+	}
+	return repo, version, commitHash, nil
+}
+
+func main() {
+	if len(os.Args) != 2 && len(os.Args) != 3 {
+		err := fmt.Errorf("usage: %s <envoy_repo_directory> [version_tag]", os.Args[0])
 		panic(err)
 	}
 
+	repoDir := os.Args[1]
+	var repo *git.Repository
+	var err error
 	var version string
 	var commitHash plumbing.Hash
-	if err == nil {
-		version = h.Name().Short()
-		commitHash = h.Hash()
+	if len(os.Args) == 3 {
+		// Use the release tag directly; the checked out branch doesn't matter.
+		version = os.Args[2]
+		if !strings.HasPrefix(version, "v") {
+			version = "v" + version
+		}
+		out, err := runGit(repoDir, "rev-parse", "--verify", "refs/tags/"+version+"^{commit}")
+		if err != nil {
+			panic(fmt.Errorf("cannot find tag %s: %w", version, err))
+		}
+		commitHash = plumbing.NewHash(strings.TrimSpace(out))
+		repo, err = openRepo(repoDir)
+		if err != nil {
+			panic(err)
+		}
 	} else {
-		// go-git doesn't support linked worktrees; read HEAD from the worktree gitdir directly
-		// and reopen the main repo so CommitObject/Blame can access the full object store.
-		version, commitHash, err = readWorktreeHead(repoDir)
+		repo, version, commitHash, err = openRepoAtHead(repoDir)
 		if err != nil {
 			panic(err)
 		}
-		mainWorkDir, err := findMainWorkDir(repoDir)
-		if err != nil {
-			panic(err)
+	}
+
+	// Starting with v1.39, envoy keeps one file per entry in
+	// changelogs/current/<section>/<area>__<slug>.rst instead of current.yaml.
+	out, err := runGit(repoDir, "ls-tree", "--name-only", commitHash.String(), "--", changeLogFile, changeLogDir)
+	if err != nil {
+		panic(err)
+	}
+	found := strings.Fields(out)
+	useEntryDir := false
+	if !slices.Contains(found, changeLogFile) {
+		if !slices.Contains(found, changeLogDir) {
+			panic(fmt.Errorf("Neither %s nor %s/ exists in %s", changeLogFile, changeLogDir, version))
 		}
-		repo, err = git.PlainOpen(mainWorkDir)
-		if err != nil {
-			panic(err)
-		}
+		useEntryDir = true
 	}
 
 	if !strings.HasPrefix(version, "v") {
